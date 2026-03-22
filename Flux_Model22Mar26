@@ -1,0 +1,412 @@
+# interior_redesign_final.py
+# FLUX.1-schnell + ControlNet Union Pro 2.0 (depth + canny)
+# Fast, clean, no CLIP, single image output
+
+# ─── Install (run first in Colab) ────────────────────────────────────────────
+# !pip install -q -U diffusers transformers accelerate sentencepiece protobuf opencv-python
+
+import torch
+import numpy as np
+import cv2
+from PIL import Image
+from diffusers import FluxControlNetPipeline, FluxControlNetModel
+from diffusers.models import FluxMultiControlNetModel
+from diffusers.utils import load_image
+from transformers import pipeline as hf_pipeline
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION — only edit this section
+# ─────────────────────────────────────────────────────────────────────────────
+
+CONFIG = {
+    "image_path": "/content/download-tttwnf-161413.jpeg",
+    "room_type": "bedroom",       # bedroom | living_room | bathroom | kitchen
+    "style": "modern",            # see styles per room type below
+    "extra_prompt": "",           # optional e.g. "with a fireplace"
+    "num_inference_steps": 4,     # schnell is optimized for 4 steps
+    "guidance_scale": 0,          # schnell uses 0
+    "depth_scale": 0.6,
+    "canny_scale": 0.4,
+    "control_guidance_end": 0.6,
+    "device": "cuda",
+    "hf_token": "",               # HuggingFace token
+}
+
+# Available styles:
+#   bedroom:     modern | minimalist | scandinavian | industrial | bohemian
+#   living_room: modern | minimalist | scandinavian | industrial | bohemian
+#   bathroom:    modern | minimalist | spa | industrial
+#   kitchen:     modern | minimalist | rustic | industrial
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STYLES
+# ─────────────────────────────────────────────────────────────────────────────
+
+STYLES = {
+    "bedroom": {
+        "modern": {
+            "prompt": (
+                "A contemporary modern bedroom. Upholstered bed with curved headboard in warm grey velvet, "
+                "sculptural bedside lamps, textured wall paneling, deep walnut wood floor, "
+                "layered neutral textiles, ambient warm lighting, statement artwork above bed. "
+                "Rich materials, considered design, no clutter. "
+                "Interior photography, sharp focus, 8k, photorealistic."
+            ),
+            "negative_prompt": (
+                "text, writing, letters, words, numbers, watermark, signature, logo, typography, font, alphabet, symbols, inscriptions, dining table, coffee table, chairs, wrong furniture, kitchen, bathroom, "
+                "text, watermark, person, people, face, clothes, laundry, clutter, "
+                "blurry, low quality, cartoon, cold, sterile, plain white walls"
+            ),
+        },
+        "minimalist": {
+            "prompt": (
+                "A pure minimalist bedroom. Ultra low platform bed with white and off-white linen, "
+                "simple white nightstand, bare white walls, light bleached oak or pale concrete floor, "
+                "single recessed light, no decorations, nothing on surfaces, "
+                "all white and off-white palette, only small black accents if any. "
+                "Architectural photography, sharp focus, 8k, photorealistic."
+            ),
+            "negative_prompt": (
+                "text, writing, letters, words, numbers, watermark, signature, logo, typography, font, alphabet, symbols, inscriptions, dining table, chairs, wrong furniture, kitchen, bathroom, "
+                "text, watermark, person, people, face, clothes, laundry, clutter, decorations, art, plants, "
+                "blurry, low quality, cartoon, busy, colorful, dark colors, black sofa, black bed, "
+                "brown, grey, beige, warm tones, headboard"
+            ),
+        },
+        "scandinavian": {
+            "prompt": (
+                "A scandinavian hygge bedroom. Simple birch bed frame with white bedding, "
+                "warm white walls, pine wood floor, soft pendant lamp, small plant. No clutter. "
+                "Interior photography, sharp focus, 8k, photorealistic."
+            ),
+            "negative_prompt": (
+                "text, writing, letters, words, numbers, watermark, signature, logo, typography, font, alphabet, symbols, inscriptions, dining table, chairs, wrong furniture, kitchen, bathroom, "
+                "text, watermark, person, people, face, clothes, laundry, clutter, "
+                "blurry, low quality, cartoon, cold, industrial"
+            ),
+        },
+        "industrial": {
+            "prompt": (
+                "An industrial loft bedroom. Black metal bed frame, exposed brick wall, "
+                "polished concrete floor, Edison pendant bulbs, black iron shelving. No clutter. "
+                "Interior photography, sharp focus, 8k, photorealistic."
+            ),
+            "negative_prompt": (
+                "text, writing, letters, words, numbers, watermark, signature, logo, typography, font, alphabet, symbols, inscriptions, dining table, chairs, wrong furniture, kitchen, bathroom, "
+                "text, watermark, person, people, face, clothes, laundry, clutter, "
+                "blurry, low quality, cartoon, pastel, floral"
+            ),
+        },
+        "bohemian": {
+            "prompt": (
+                "A bohemian bedroom. Low wooden bed with layered terracotta textiles, "
+                "woven rug, macrame wall hanging, brass pendant, trailing plants, earthy walls. No clutter. "
+                "Interior photography, sharp focus, 8k, photorealistic."
+            ),
+            "negative_prompt": (
+                "text, writing, letters, words, numbers, watermark, signature, logo, typography, font, alphabet, symbols, inscriptions, dining table, chairs, wrong furniture, kitchen, bathroom, "
+                "text, watermark, person, people, face, clothes, laundry, clutter, "
+                "blurry, low quality, cartoon, cold, sterile"
+            ),
+        },
+    },
+    "living_room": {
+        "modern": {
+            "prompt": (
+                "A contemporary modern living room. Large curved sectional sofa in warm bouclé, "
+                "sculptural marble coffee table, warm oak floor, textured plaster walls, "
+                "dramatic pendant light, layered rugs, curated art and objects. "
+                "Rich and considered design, no clutter. "
+                "Interior photography, sharp focus, 8k, photorealistic."
+            ),
+            "negative_prompt": (
+                "text, writing, letters, words, numbers, watermark, signature, logo, typography, font, alphabet, symbols, inscriptions, bed, bedroom, bathroom, kitchen, wrong furniture, "
+                "text, watermark, person, people, face, clutter, "
+                "blurry, low quality, cartoon, plain white walls, sterile"
+            ),
+        },
+        "minimalist": {
+            "prompt": (
+                "A pure minimalist living room. Single low sofa in white or off-white linen, "
+                "one small white side table, bare white walls, pale concrete or light oak floor, "
+                "no art, no plants, no decorations, nothing on surfaces, "
+                "one thin white floor lamp, complete emptiness. "
+                "All white and off-white palette, only small black accents if any. "
+                "Architectural photography, sharp focus, 8k, photorealistic."
+            ),
+            "negative_prompt": (
+                "text, writing, letters, words, numbers, watermark, signature, logo, typography, font, alphabet, symbols, inscriptions, bed, bedroom, bathroom, kitchen, wrong furniture, "
+                "text, watermark, person, people, face, clutter, decorations, art, plants, rugs, "
+                "blurry, low quality, cartoon, busy, colorful, dark colors, black sofa, "
+                "brown, grey, beige, warm tones"
+            ),
+        },
+        "scandinavian": {
+            "prompt": (
+                "A scandinavian living room. Linen sofa, birch coffee table, white walls, "
+                "oak floor, woolen throw, small plant. No clutter. "
+                "Interior photography, sharp focus, 8k, photorealistic."
+            ),
+            "negative_prompt": (
+                "text, writing, letters, words, numbers, watermark, signature, logo, typography, font, alphabet, symbols, inscriptions, bed, bedroom, bathroom, kitchen, wrong furniture, "
+                "text, watermark, person, people, face, clutter, "
+                "blurry, low quality, cartoon, industrial"
+            ),
+        },
+        "industrial": {
+            "prompt": (
+                "An industrial living room. Dark leather sofa, steel coffee table, "
+                "concrete wall, Edison bulbs, metal shelving. No clutter. "
+                "Interior photography, sharp focus, 8k, photorealistic."
+            ),
+            "negative_prompt": (
+                "text, writing, letters, words, numbers, watermark, signature, logo, typography, font, alphabet, symbols, inscriptions, bed, bedroom, bathroom, kitchen, wrong furniture, "
+                "text, watermark, person, people, face, clutter, "
+                "blurry, low quality, cartoon, pastel"
+            ),
+        },
+        "bohemian": {
+            "prompt": (
+                "A bohemian living room. Colorful cushions, kilim rugs, macrame, rattan, "
+                "trailing plants, string lights, terracotta walls. "
+                "Interior photography, sharp focus, 8k, photorealistic."
+            ),
+            "negative_prompt": (
+                "text, writing, letters, words, numbers, watermark, signature, logo, typography, font, alphabet, symbols, inscriptions, bed, bedroom, bathroom, kitchen, wrong furniture, "
+                "text, watermark, person, people, face, clutter, "
+                "blurry, low quality, cartoon, sterile"
+            ),
+        },
+    },
+    "bathroom": {
+        "modern": {
+            "prompt": (
+                "A contemporary modern bathroom. Freestanding sculptural soaking tub, "
+                "large format warm stone tiles, floating double vanity, brushed gold fixtures, "
+                "backlit frameless mirror, warm ambient lighting, single large plant. No clutter. "
+                "Interior photography, sharp focus, 8k, photorealistic."
+            ),
+            "negative_prompt": (
+                "text, writing, letters, words, numbers, watermark, signature, logo, typography, font, alphabet, symbols, inscriptions, bed, bedroom, living room, kitchen, "
+                "text, watermark, person, people, face, toiletries mess, clutter, "
+                "blurry, low quality, cartoon, cold, sterile, white tiles"
+            ),
+        },
+        "minimalist": {
+            "prompt": (
+                "A pure minimalist bathroom. Simple white rectangular basin on a white shelf, "
+                "white or off-white walls, pale concrete or white tile floor, single thin mirror, "
+                "one recessed light, no decorations, no plants, no toiletries visible. "
+                "All white and off-white palette, thin black fixtures as only accent. "
+                "Architectural photography, sharp focus, 8k, photorealistic."
+            ),
+            "negative_prompt": (
+                "text, writing, letters, words, numbers, watermark, signature, logo, typography, font, alphabet, symbols, inscriptions, bed, bedroom, living room, kitchen, "
+                "text, watermark, person, people, face, clutter, decorations, plants, toiletries, "
+                "blurry, low quality, cartoon, colorful, dark colors, black surfaces, "
+                "brown, beige, warm tones, busy"
+            ),
+        },
+        "spa": {
+            "prompt": (
+                "A luxury spa bathroom. Travertine stone, deep soaking tub, rainfall shower, "
+                "teak accents, ambient lighting, tropical plants. No clutter. "
+                "Interior photography, sharp focus, 8k, photorealistic."
+            ),
+            "negative_prompt": (
+                "text, writing, letters, words, numbers, watermark, signature, logo, typography, font, alphabet, symbols, inscriptions, bed, bedroom, living room, kitchen, "
+                "text, watermark, person, people, face, clutter, "
+                "blurry, low quality, cartoon, industrial"
+            ),
+        },
+        "industrial": {
+            "prompt": (
+                "An industrial bathroom. Concrete walls, black fixtures, vessel sink, "
+                "Edison mirror, black hexagon tiles. No clutter. "
+                "Interior photography, sharp focus, 8k, photorealistic."
+            ),
+            "negative_prompt": (
+                "text, writing, letters, words, numbers, watermark, signature, logo, typography, font, alphabet, symbols, inscriptions, bed, bedroom, living room, kitchen, "
+                "text, watermark, person, people, face, clutter, "
+                "blurry, low quality, cartoon, pastel, floral"
+            ),
+        },
+    },
+    "kitchen": {
+        "modern": {
+            "prompt": (
+                "A contemporary modern kitchen. Handleless cabinets in deep charcoal and warm oak, "
+                "thick marble island with waterfall edge, statement pendant lights, "
+                "integrated appliances, warm under-cabinet lighting, herringbone tile backsplash. "
+                "Counters clear, considered design. "
+                "Interior photography, sharp focus, 8k, photorealistic."
+            ),
+            "negative_prompt": (
+                "text, writing, letters, words, numbers, watermark, signature, logo, typography, font, alphabet, symbols, inscriptions, bed, bedroom, living room, bathroom, "
+                "text, watermark, person, people, face, dirty dishes, clutter, "
+                "blurry, low quality, cartoon, rustic, all white, plain"
+            ),
+        },
+        "minimalist": {
+            "prompt": (
+                "A pure minimalist kitchen. Seamless white handleless cabinets floor to ceiling, "
+                "thin white quartz countertop, no island, hidden integrated appliances, "
+                "single strip of recessed light, no objects on any surface, "
+                "white walls, pale concrete or white tile floor. "
+                "All white and off-white palette, thin black handles as only accent. "
+                "Architectural photography, sharp focus, 8k, photorealistic."
+            ),
+            "negative_prompt": (
+                "text, writing, letters, words, numbers, watermark, signature, logo, typography, font, alphabet, symbols, inscriptions, bed, bedroom, living room, bathroom, "
+                "text, watermark, person, people, face, dirty dishes, clutter, decorations, plants, "
+                "blurry, low quality, cartoon, rustic, colorful, dark colors, black cabinets, "
+                "brown, beige, warm tones, busy"
+            ),
+        },
+        "rustic": {
+            "prompt": (
+                "A rustic farmhouse kitchen. Shaker oak cabinets, butcher block counters, "
+                "farmhouse sink, open shelving, exposed beams. Counters clear. "
+                "Interior photography, sharp focus, 8k, photorealistic."
+            ),
+            "negative_prompt": (
+                "text, writing, letters, words, numbers, watermark, signature, logo, typography, font, alphabet, symbols, inscriptions, bed, bedroom, living room, bathroom, "
+                "text, watermark, person, people, face, dirty dishes, clutter, "
+                "blurry, low quality, cartoon, modern, cold"
+            ),
+        },
+        "industrial": {
+            "prompt": (
+                "An industrial kitchen. Stainless steel counters, black cabinets, "
+                "exposed brick, metal shelving, Edison bulbs. Counters clear. "
+                "Interior photography, sharp focus, 8k, photorealistic."
+            ),
+            "negative_prompt": (
+                "text, writing, letters, words, numbers, watermark, signature, logo, typography, font, alphabet, symbols, inscriptions, bed, bedroom, living room, bathroom, "
+                "text, watermark, person, people, face, dirty dishes, clutter, "
+                "blurry, low quality, cartoon, pastel"
+            ),
+        },
+    },
+}
+
+
+# ─── Load models ──────────────────────────────────────────────────────────────
+
+def load_models(config):
+    """Load FLUX schnell + ControlNet"""
+    device = config["device"]
+
+    print("Loading depth estimator...")
+    depth_estimator = hf_pipeline(
+        "depth-estimation",
+        model="depth-anything/Depth-Anything-V2-Small-hf",
+        device=0 if device == "cuda" else -1,
+    )
+
+    print("Loading ControlNet Union Pro 2.0...")
+    controlnet_union = FluxControlNetModel.from_pretrained(
+        "Shakker-Labs/FLUX.1-dev-ControlNet-Union-Pro-2.0",
+        torch_dtype=torch.bfloat16,
+    )
+    controlnet = FluxMultiControlNetModel([controlnet_union])
+
+    print("Loading FLUX schnell pipeline...")
+    pipe = FluxControlNetPipeline.from_pretrained(
+        "black-forest-labs/FLUX.1-schnell",
+        controlnet=controlnet,
+        torch_dtype=torch.bfloat16,
+    )
+    pipe.enable_model_cpu_offload()
+    pipe.enable_attention_slicing()
+
+    return depth_estimator, pipe
+
+
+
+
+# ─── Control images ───────────────────────────────────────────────────────────
+
+def get_depth_map(image, depth_estimator):
+    depth = depth_estimator(image)["depth"]
+    return depth.convert("RGB").resize(image.size)
+
+
+def get_canny_edges(image):
+    img_array = np.array(image.convert("RGB"))
+    gray      = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    edges     = cv2.Canny(gray, 100, 200)
+    return Image.fromarray(cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB))
+
+
+# ─── Main pipeline ────────────────────────────────────────────────────────────
+
+def redesign_room(config=CONFIG):
+    device       = config["device"]
+    image_path   = config["image_path"]
+    room_type    = config["room_type"]
+    style        = config["style"]
+    extra_prompt = config["extra_prompt"]
+
+    if room_type not in STYLES:
+        raise ValueError(f"Unknown room_type '{room_type}'. Choose from: {list(STYLES.keys())}")
+    if style not in STYLES[room_type]:
+        raise ValueError(f"Unknown style '{style}' for '{room_type}'. Choose from: {list(STYLES[room_type].keys())}")
+
+    if config.get("hf_token"):
+        from huggingface_hub import login
+        login(token=config["hf_token"])
+
+    image = load_image(image_path).convert("RGB").resize((768, 768), Image.LANCZOS)
+
+    style_config    = STYLES[room_type][style]
+    prompt          = style_config["prompt"]
+    if extra_prompt:
+        prompt = prompt + " " + extra_prompt + "."
+    negative_prompt = style_config["negative_prompt"]
+
+    print(f"Room: {room_type} | Style: {style}")
+
+    # All styles use the same ControlNet pipeline
+    depth_estimator, pipe = load_models(config)
+
+    print("Generating depth map...")
+    depth_image = get_depth_map(image, depth_estimator)
+    depth_image.save("depth_map.png")
+
+    print("Generating canny edges...")
+    canny_image = get_canny_edges(image)
+    canny_image.save("canny_edges.png")
+
+    print("Generating image with FLUX...")
+    result = pipe(
+        prompt=prompt,
+        control_image=[depth_image, canny_image],
+        control_mode=[2, 0],
+        controlnet_conditioning_scale=[config["depth_scale"], config["canny_scale"]],
+        control_guidance_end=config["control_guidance_end"],
+        num_inference_steps=config["num_inference_steps"],
+        guidance_scale=config["guidance_scale"],
+        height=768,
+        width=768,
+    ).images[0]
+
+    result.save("output_best.png")
+
+    comparison = Image.new("RGB", (image.width * 2 + 20, image.height), (20, 20, 20))
+    comparison.paste(image, (0, 0))
+    comparison.paste(result.resize((image.width, image.height)), (image.width + 20, 0))
+    comparison.save("comparison.png")
+
+    print("Done. Saved: output_best.png, comparison.png")
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN — only edit CONFIG at the top
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    redesign_room(CONFIG)
